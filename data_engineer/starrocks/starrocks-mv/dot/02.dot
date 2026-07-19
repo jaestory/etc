@@ -1,0 +1,36 @@
+digraph G {
+  rankdir=TB; bgcolor="white"; compound=true;
+  graph [fontname="Noto Sans CJK KR", fontsize=13, labelloc=t, label="전체 아키텍처 — 쓰기 경로(Refresh)와 읽기 경로(Query)는 FE 메타데이터로만 만난다"];
+  node [fontname="Noto Sans CJK KR", shape=box, style="rounded,filled", fontsize=11, margin="0.22,0.12"];
+  edge [fontname="Noto Sans CJK KR", fontsize=10];
+
+  subgraph cluster_w {
+    label="쓰기 경로 (Refresh Path)"; style="rounded"; color="#2A7F7F"; fontcolor="#2A7F7F";
+    BT [label="Base Table\n(Iceberg / Native)", fillcolor="#F2F2F2", color="#888888"];
+    CD [label="변경 감지\n(파티션 버전 / Iceberg snapshot 비교)", fillcolor="#E6F3F3", color="#2A7F7F"];
+    TM [label="FE TaskManager\n(refresh task 스케줄링)", fillcolor="#E6F3F3", color="#2A7F7F"];
+    TR [label="TaskRun 실행\nPCT: 파티션 단위 INSERT OVERWRITE\nINCREMENTAL: snapshot delta 반영 (4.1)", fillcolor="#E6F3F3", color="#2A7F7F"];
+    MVT [label="MV Table\n(StarRocks 내부 OLAP 테이블)", fillcolor="#D2EAEA", color="#2A7F7F", penwidth=1.8];
+    BT -> CD -> TM -> TR -> MVT;
+  }
+
+  META [label="FE 메타데이터\n(base 파티션 버전 맵 · refresh 상태 · MV active 여부)", fillcolor="#FFF6E5", color="#CC8B00", penwidth=1.5];
+  TR -> META [label="반영 버전 갱신"];
+
+  subgraph cluster_r {
+    label="읽기 경로 (Query Path)"; style="rounded"; color="#2A7F7F"; fontcolor="#2A7F7F";
+    SQL [label="사용자 쿼리\n(base table 대상)", fillcolor="#F2F2F2", color="#888888"];
+    OPT [label="Optimizer (CBO)", fillcolor="#E6F3F3", color="#2A7F7F"];
+    RW [label="MV Rewrite\n후보 매칭 + 신선도 검사", shape=diamond, fillcolor="#FFF6E5", color="#CC8B00"];
+    P1 [label="MV 스캔 플랜", fillcolor="#D2EAEA", color="#2A7F7F"];
+    P2 [label="Base 스캔 플랜", fillcolor="#F2F2F2", color="#888888"];
+    EX [label="BE / CN 실행", fillcolor="#E6F3F3", color="#2A7F7F"];
+    SQL -> OPT -> RW;
+    RW -> P1 [label="성립"];
+    RW -> P2 [label="불성립"];
+    P1 -> EX; P2 -> EX;
+  }
+
+  META -> RW [label="후보 MV + 신선도 정보", style=dashed];
+  MVT -> P1 [label="스캔 대상", style=dashed];
+}

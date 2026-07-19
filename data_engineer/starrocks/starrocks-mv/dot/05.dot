@@ -1,0 +1,27 @@
+digraph G {
+  rankdir=LR; bgcolor="white";
+  graph [fontname="Noto Sans CJK KR", fontsize=13, labelloc=t, label="파티션 매핑 (N:1 예시) — 증분 refresh와 파티션 단위 신선도 판정의 전제"];
+  node [fontname="Noto Sans CJK KR", shape=box, style="rounded,filled", fontsize=11, margin="0.2,0.1"];
+  edge [fontname="Noto Sans CJK KR", fontsize=10];
+
+  subgraph cluster_b {
+    label="Iceberg Base Table (일 단위 파티션 · day transform)"; style="rounded"; color="#888888"; fontcolor="#666666";
+    B1 [label="p20260701", fillcolor="#F2F2F2", color="#888888"];
+    B2 [label="p20260702  ← 변경 발생", fillcolor="#FFE9E3", color="#C0532F"];
+    B3 [label="...", fillcolor="#F2F2F2", color="#888888", shape=plaintext, style=""];
+    B31 [label="p20260731", fillcolor="#F2F2F2", color="#888888"];
+  }
+
+  subgraph cluster_m {
+    label="MV (월 단위 · PARTITION BY date_trunc('month', dt))"; style="rounded"; color="#2A7F7F"; fontcolor="#2A7F7F";
+    M1 [label="p202607\n← 이 파티션만 재계산 (PCT)", fillcolor="#D2EAEA", color="#2A7F7F", penwidth=1.8];
+  }
+
+  B1 -> M1 [color="#AAAAAA"];
+  B2 -> M1 [color="#C0532F", penwidth=1.8, label="N:1 rollup 매핑"];
+  B31 -> M1 [color="#AAAAAA"];
+
+  NOTE [shape=note, fillcolor="#FFFDF0", color="#CC8B00", fontsize=10,
+    label="매핑 가능한 Iceberg partition transform:\nidentity / year / month / day / hour (v3.2.3+)\nbucket · truncate 는 매핑 불가\n다중 컬럼 파티션 매핑 지원 (1:1, N:1)"];
+  M1 -> NOTE [style=invis];
+}

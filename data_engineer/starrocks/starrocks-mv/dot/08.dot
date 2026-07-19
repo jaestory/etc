@@ -1,0 +1,31 @@
+digraph G {
+  rankdir=LR; bgcolor="white";
+  graph [fontname="Noto Sans CJK KR", fontsize=13, labelloc=t, label="Iceberg + Polaris 환경 — 변경 감지 · refresh · rewrite 게이트가 모두 catalog 메타데이터에 의존"];
+  node [fontname="Noto Sans CJK KR", shape=box, style="rounded,filled", fontsize=11, margin="0.22,0.12"];
+  edge [fontname="Noto Sans CJK KR", fontsize=10];
+
+  POL [label="Polaris\n(Iceberg REST Catalog)", fillcolor="#F2F2F2", color="#888888"];
+  S3 [label="S3\nmetadata.json / manifest /\nsnapshot / data files", fillcolor="#F2F2F2", color="#888888"];
+  SPK [label="Spark 등 외부 엔진\n(쓰기 · 컴팩션 · 스키마 변경)", fillcolor="#FFF6E5", color="#CC8B00"];
+
+  subgraph cluster_fe {
+    label="StarRocks FE"; style="rounded"; color="#2A7F7F"; fontcolor="#2A7F7F";
+    MC [label="Iceberg 메타데이터 캐시", fillcolor="#E6F3F3", color="#2A7F7F"];
+    VM [label="MV 버전 맵\n(base 파티션/snapshot → 반영 상태)", fillcolor="#E6F3F3", color="#2A7F7F"];
+  }
+
+  RF [label="Refresh Task\nPCT: 변경 파티션 재계산\nINCREMENTAL: snapshot delta 반영", fillcolor="#D2EAEA", color="#2A7F7F"];
+  RW [label="Query Rewrite\n신선도 게이트", fillcolor="#D2EAEA", color="#2A7F7F"];
+
+  SPK -> POL [label="커밋"];
+  SPK -> S3 [label="파일 쓰기"];
+  POL -> MC [label="테이블 메타 위치"];
+  S3 -> MC [label="snapshot · 파티션 정보"];
+  MC -> VM;
+  VM -> RF [label="갱신 필요 판정"];
+  VM -> RW [label="stale 여부 판정"];
+
+  WARN [shape=note, fillcolor="#FBEAEA", color="#B03030", fontsize=10,
+    label="운영 주의\n· 메타데이터 캐시 지연 → 변경 감지 오판\n· Polaris 장애 → refresh/rewrite 전파 지연\n· 외부 컴팩션(replace snapshot) → INCREMENTAL MV 증분 불가\n· 외부 스키마 변경 → MV INACTIVE 전환"];
+  RW -> WARN [style=invis];
+}

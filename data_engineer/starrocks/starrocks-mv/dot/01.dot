@@ -1,0 +1,25 @@
+digraph G {
+  rankdir=LR; bgcolor="white";
+  graph [fontname="Noto Sans CJK KR", fontsize=13, labelloc=t, label="쿼리 가속 3계층 — Data Cache는 I/O 절감, MV는 계산 절감"];
+  node [fontname="Noto Sans CJK KR", shape=box, style="rounded,filled", fontsize=12, margin="0.25,0.15"];
+  edge [fontname="Noto Sans CJK KR", fontsize=11];
+
+  Q [label="Query", fillcolor="#FFF6E5", color="#CC8B00", penwidth=1.5];
+
+  subgraph cluster_sr {
+    label="StarRocks"; style="rounded"; color="#2A7F7F"; fontcolor="#2A7F7F";
+    DC [label="Data Cache\n(블록 단위 파일 캐시)", fillcolor="#E6F3F3", color="#2A7F7F"];
+    MV [label="Materialized View\n(사전 계산 결과 · 로컬 저장)", fillcolor="#D2EAEA", color="#2A7F7F", penwidth=1.8];
+  }
+
+  subgraph cluster_lake {
+    label="Data Lake (S3 + Iceberg)"; style="rounded"; color="#888888"; fontcolor="#666666";
+    P [label="Parquet Files", fillcolor="#F2F2F2", color="#888888"];
+  }
+
+  Q -> P  [label="① 직접 스캔\n원격 I/O + 계산 매번 발생", color="#999999"];
+  Q -> DC [label="② 캐시 히트\nI/O 절감 · 계산은 매번", color="#2A7F7F"];
+  Q -> MV [label="③ MV rewrite\nI/O + 계산 모두 절감", color="#2A7F7F", penwidth=1.8];
+  DC -> P [label="miss 시 원격 read", style=dashed, color="#999999"];
+  MV -> P [label="refresh 시에만 read", style=dashed, color="#999999"];
+}

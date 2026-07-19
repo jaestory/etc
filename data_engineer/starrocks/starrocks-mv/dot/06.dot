@@ -1,0 +1,26 @@
+digraph G {
+  rankdir=TB; bgcolor="white";
+  graph [fontname="Noto Sans CJK KR", fontsize=13, labelloc=t, label="refresh_mode (4.1) — PCT vs INCREMENTAL(IVM), 같은 append 1건에 대한 동작 차이"];
+  node [fontname="Noto Sans CJK KR", shape=box, style="rounded,filled", fontsize=11, margin="0.22,0.12"];
+  edge [fontname="Noto Sans CJK KR", fontsize=10];
+
+  SNAP [label="Iceberg append snapshot\n(파티션 p20260702에 소량 신규 데이터)", fillcolor="#FFE9E3", color="#C0532F"];
+
+  subgraph cluster_p {
+    label="refresh_mode = PCT (기본)"; style="rounded"; color="#2A7F7F"; fontcolor="#2A7F7F";
+    P1 [label="변경 파티션 식별\n(파티션 수준 변경 감지)", fillcolor="#E6F3F3", color="#2A7F7F"];
+    P2 [label="해당 MV 파티션 전체 재계산\nINSERT OVERWRITE\n(변경이 1행이어도 파티션 전체)", fillcolor="#E6F3F3", color="#2A7F7F"];
+    P3 [label="transparent query rewrite 참여 가능\nFORCE / 파티션 지정 refresh 가능", fillcolor="#D2EAEA", color="#2A7F7F"];
+    P1 -> P2 -> P3;
+  }
+
+  subgraph cluster_i {
+    label="refresh_mode = INCREMENTAL (4.1 · Iceberg append-only 한정)"; style="rounded"; color="#7A4FA0"; fontcolor="#7A4FA0";
+    I1 [label="마지막 반영 snapshot 이후의\nincremental snapshot(append delta) 읽기", fillcolor="#F1EAF8", color="#7A4FA0"];
+    I2 [label="delta에 대해서만 연산 수행\n(Select/Project/Join/Aggregate)\n→ 결과를 MV에 증분 반영", fillcolor="#F1EAF8", color="#7A4FA0"];
+    I3 [label="제약 (4.1 현재)\n· query rewrite 비활성 (직접 조회 전용)\n· FORCE / 파티션 지정 refresh 거부\n· replace snapshot(컴팩션) 만나면 증분 불가", fillcolor="#FBEAEA", color="#B03030"];
+    I1 -> I2 -> I3;
+  }
+
+  SNAP -> P1; SNAP -> I1;
+}
