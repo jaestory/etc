@@ -1,0 +1,27 @@
+digraph G {
+  rankdir=TB; bgcolor="white";
+  graph [fontname="Noto Sans CJK KR", fontsize=13, labelloc=t, label="Query Rewrite 파이프라인 — 매칭 성공이 곧 채택은 아니다 (마지막은 CBO 비용 비교)"];
+  node [fontname="Noto Sans CJK KR", shape=box, style="rounded,filled", fontsize=11, margin="0.22,0.12"];
+  edge [fontname="Noto Sans CJK KR", fontsize=10];
+
+  Q [label="쿼리 (base table 대상)", fillcolor="#F2F2F2", color="#888888"];
+  C1 [label="후보 MV 수집\nactive 상태 + 관련 base 테이블 참조\n※ INCREMENTAL/AUTO MV는 후보 제외 (4.1)", fillcolor="#E6F3F3", color="#2A7F7F"];
+  G1 [label="Consistency 게이트\n버전 맵 / staleness /\nquery_rewrite_consistency 검사", shape=diamond, fillcolor="#FFF6E5", color="#CC8B00"];
+  G2 [label="구조 매칭 (SPJG)\n조인 그래프 · predicate ·\n집계 유도 가능성", shape=diamond, fillcolor="#FFF6E5", color="#CC8B00"];
+  RW1 [label="직접 rewrite\n(+ predicate / 집계 보상)", fillcolor="#D2EAEA", color="#2A7F7F"];
+  RW2 [label="Union rewrite\nMV 커버 구간 + base 잔여 구간 UNION", fillcolor="#D2EAEA", color="#2A7F7F"];
+  CBO [label="CBO 비용 비교\nrewrite 플랜 vs 원본 플랜", shape=diamond, fillcolor="#FFF6E5", color="#CC8B00"];
+  WIN [label="MV 스캔 플랜 채택", fillcolor="#D2EAEA", color="#2A7F7F", penwidth=1.8];
+  LOSE [label="Base 스캔 플랜 유지", fillcolor="#F2F2F2", color="#888888"];
+  OUT1 [label="후보 제외", fillcolor="#FBEAEA", color="#B03030"];
+
+  Q -> C1 -> G1;
+  G1 -> OUT1 [label="stale + 허용 안 됨"];
+  G1 -> G2 [label="통과"];
+  G2 -> OUT1 [label="유도 불가"];
+  G2 -> RW1 [label="완전 포함"];
+  G2 -> RW2 [label="부분 포함"];
+  RW1 -> CBO; RW2 -> CBO;
+  CBO -> WIN [label="rewrite가 저렴"];
+  CBO -> LOSE [label="원본이 저렴"];
+}

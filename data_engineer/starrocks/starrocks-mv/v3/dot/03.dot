@@ -1,0 +1,20 @@
+digraph G {
+  rankdir=TB; bgcolor="white";
+  graph [fontname="Noto Sans CJK KR", fontsize=13, labelloc=t, label="Sync MV(Rollup) vs Async MV — 물리 구조가 다르다"];
+  node [fontname="Noto Sans CJK KR", shape=box, style="rounded,filled", fontsize=11, margin="0.22,0.12"];
+  edge [fontname="Noto Sans CJK KR", fontsize=10];
+
+  subgraph cluster_s {
+    label="Sync MV (Rollup) — Native 테이블 전용"; style="rounded"; color="#888888"; fontcolor="#666666";
+    BT1 [label="Base Table (Native OLAP)", fillcolor="#F2F2F2", color="#888888"];
+    R1 [label="Rollup Index\n(base table 내부의 부속 구조)", fillcolor="#F2F2F2", color="#888888"];
+    BT1 -> R1 [label="적재 트랜잭션에 포함되어\n동기 갱신", dir=both];
+  }
+
+  subgraph cluster_a {
+    label="Async MV — Iceberg 등 external catalog 지원 (우리 환경)"; style="rounded"; color="#2A7F7F"; fontcolor="#2A7F7F";
+    BT2 [label="Base Table(s)\nNative / Iceberg / Hive / View / MV ...", fillcolor="#F2F2F2", color="#888888"];
+    MV2 [label="독립된 물리 OLAP 테이블\n자체 파티션 · 버킷 · sort key · 인덱스", fillcolor="#D2EAEA", color="#2A7F7F", penwidth=1.8];
+    BT2 -> MV2 [label="비동기 refresh task\n(스케줄 / 수동)"];
+  }
+}

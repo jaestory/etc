@@ -1,0 +1,18 @@
+digraph G {
+  rankdir=LR; bgcolor="white";
+  graph [fontname="Noto Sans CJK KR", fontsize=13, labelloc=t, label="Refresh 실행 구조 — Task/TaskRun 라이프사이클\n(실선 = 실행 흐름 · 점선 = 참조/관측)"];
+  node [fontname="Noto Sans CJK KR", shape=box, style="rounded,filled", fontsize=11, margin="0.22,0.12"];
+  edge [fontname="Noto Sans CJK KR", fontsize=10];
+
+  TRG [label="① 트리거\n스케줄(EVERY) 도래 / 수동 REFRESH\n※ external MV는 변경 트리거 미지원", fillcolor="#FFF6E5", color="#CC8B00"];
+  TM [label="FE TaskManager\n(MV별 Task 등록 · 스케줄 관리)", fillcolor="#E6F3F3", color="#2A7F7F"];
+  TR [label="② TaskRun 생성 · 큐잉 (PENDING)\nMV당 동시 실행 1개 · 기본 우선순위 LOWEST\n대기분 존재 시 신규 트리거는 MERGED로 병합", fillcolor="#E6F3F3", color="#2A7F7F"];
+  CALC [label="③ 처리 시작 (RUNNING)\n버전 맵 vs 현재 상태 비교로\n갱신 필요 MV 파티션 산출 → 공집합이면 스킵", fillcolor="#E6F3F3", color="#2A7F7F"];
+  EXE [label="④ 배치 실행 (BE/CN)\npartition_refresh_number 단위 분할\n배치별 INSERT OVERWRITE (= sub-task run)", fillcolor="#D2EAEA", color="#2A7F7F", penwidth=1.8];
+  DONE [label="⑤ 배치 성공 시 버전 맵 즉시 갱신\n전 배치 성공 시 SUCCESS 확정 (v3.3+)\n중간 실패해도 성공분 진행 보존", fillcolor="#E6F3F3", color="#2A7F7F"];
+  OBS [label="관측\nSHOW MATERIALIZED VIEWS\ntask_runs (STATE · CREATE_TIME vs\nPROCESS_START_TIME · EXTRA_MESSAGE)\nINSERT OVERWRITE query profile", fillcolor="#F2F2F2", color="#888888"];
+
+  TRG -> TM -> TR -> CALC -> EXE -> DONE;
+  DONE -> EXE [label="남은 배치 = 후속 task run", style=dashed, constraint=false];
+  DONE -> OBS [style=dashed];
+}
