@@ -1,0 +1,18 @@
+digraph G {
+  rankdir=LR; bgcolor="white";
+  graph [fontname="Noto Sans CJK KR", fontsize=13, labelloc=t, label="Refresh 실행 구조 — FE Task 프레임워크"];
+  node [fontname="Noto Sans CJK KR", shape=box, style="rounded,filled", fontsize=11, margin="0.22,0.12"];
+  edge [fontname="Noto Sans CJK KR", fontsize=10];
+
+  TRG [label="트리거\n스케줄(EVERY) / 수동(REFRESH)\n※ external MV는 변경 트리거 미지원", fillcolor="#FFF6E5", color="#CC8B00"];
+  TM [label="FE TaskManager", fillcolor="#E6F3F3", color="#2A7F7F"];
+  CALC [label="갱신 필요 파티션 계산\n(버전 맵 vs 현재 상태 비교)", fillcolor="#E6F3F3", color="#2A7F7F"];
+  TR [label="TaskRun 생성\nPENDING → RUNNING", fillcolor="#E6F3F3", color="#2A7F7F"];
+  EXE [label="BE/CN 실행\n파티션 배치 단위 INSERT OVERWRITE\n(partition_refresh_number / adaptive)", fillcolor="#D2EAEA", color="#2A7F7F", penwidth=1.8];
+  DONE [label="상태 확정\nSUCCESS / FAILED\n+ 버전 맵 갱신", fillcolor="#E6F3F3", color="#2A7F7F"];
+  OBS [label="관측\nSHOW MATERIALIZED VIEWS\ninformation_schema.task_runs\n(EXTRA_MESSAGE: 대상 파티션 상세)", fillcolor="#F2F2F2", color="#888888"];
+
+  TRG -> TM -> CALC -> TR -> EXE -> DONE;
+  DONE -> TR [label="남은 배치 반복", style=dashed, constraint=false];
+  DONE -> OBS [style=dashed];
+}
