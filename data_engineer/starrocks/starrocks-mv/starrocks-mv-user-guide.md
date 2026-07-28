@@ -510,3 +510,680 @@ SHOW MATERIALIZED VIEWS FROM dw WHERE NAME = 'mv_sales_daily_store_agg';
 ---
 
 *작성: 2026-07. StarRocks 4.1.1 기준. 내부 동작·설계 원리는 「StarRocks MV 엔지니어링 심화 가이드」 참고. 예시 테이블명은 실제 환경에 맞게 치환할 것. "(팀 확정 후 기입)" 표기 항목은 플랫폼 정책 확정 시 갱신한다.*
+
+
+
+
+
+Spark 심화 — 1부: 배치 실행 모델
+■ 1. 실행 계층 (질문 오면 이 순서로)
+사용자 코드 → 논리 플랜 → 최적화 논리 플랜 → 물리 플랜 → RDD DAG → Stage → Task
+
+Catalyst 4단계: Analysis(스키마·컬럼 해석) → Logical Optimization(predicate pushdown, projection pruning, constant folding) → Physical Planning(조인 전략 선택 등 후보 생성 후 비용 비교) → Code Generation(Tungsten이 JVM 바이트코드 생성)
+Logical Optimization : 읽는 양과 계산하는 양을 줄이는 과정
+
+
+Whole-Stage CodeGen: 연산자 체인을 하나의 함수로 합쳐 가상 함수 호출·중간 객체 생성 제거
+
+
+UDF가 최적화 장벽인 이유: Catalyst가 내부를 못 봐서 pushdown·codegen이 끊김. PySpark UDF는 더 나쁨 — JVM↔Python 직렬화 왕복 발생 → Pandas UDF(Arrow 기반)로 완화
+
+
+■ 2. Job/Stage/Task 경계
+Action 하나 = Job 하나 (count, write, collect)
+
+
+Shuffle = Stage 경계. Stage는 앞이 전부 끝나야 다음 시작 (배리어)
+
+
+Task = 파티션 하나 처리 단위. Stage의 태스크 수 = 그 스테이지 파티션 수
+
+
+앵커: “느린 태스크 하나가 스테이지 전체를 붙잡는다”
+
+
+■ 3. AQE (Spark 3+, 실무에서 제일 자주 언급)
+런타임 통계로 플랜을 다시 짜는 기능. 세 가지:
+파티션 병합(coalesce shuffle partitions): shuffle 후 작은 파티션들을 합쳐 태스크 수 최적화 → spark.sql.shuffle.partitions를 크게 잡아도 안전해짐
+
+
+Skew Join 처리: 큰 파티션을 감지해 자동 분할
+
+
+조인 전략 전환: 실제 크기를 보고 Sort-Merge → Broadcast로 변경
+
+
+한계: 파티션 경계에서만 개입 — 소스 읽기 단계의 스큐나 극단적 편중은 못 잡음 → Salting
+
+
+■ 4. 조인 전략 정리
+전략
+조건
+비용
+위험
+Broadcast Hash
+한쪽 < 임계(10MB 기본)
+shuffle 없음, 최선
+Driver OOM
+Sort-Merge
+대용량×대용량
+shuffle + 정렬
+skew 취약
+Shuffle Hash
+한쪽이 중간 크기
+정렬 없음
+executor 메모리
+Bucketed Join
+양쪽 같은 키로 버킷팅 저장
+shuffle 생략
+사전 설계 필요
+
+■ 5. 메모리 모델
+Executor JVM = Reserved(300MB) + Unified(Execution ⟷ Storage) + User
++ (JVM 밖) memoryOverhead: off-heap, Python 프로세스, 네이티브
+
+Execution ⟷ Storage 동적 경계: 캐시가 실행 메모리를 뺏길 수 있음(evict), 반대는 제한적
+
+
+Spill: 부족하면 디스크로 — 죽진 않지만 급격히 느려짐. Spark UI의 Spill 지표가 튜닝 신호
+
+
+OOM 두 종류 구분 (핵심): JVM heap 부족(스택트레이스 남음) vs 컨테이너 OOMKilled(exit 137, 로그 없음) — 후자는 overhead 부족
+
+
+■ 6. 파티션 관리
+repartition(n) = 셔플 O, 균등 / coalesce(n) = 셔플 X, 불균등 가능(줄일 때만)
+
+
+repartition(col) = 키 기준 재분배 (쓰기 전 파일 수 제어에 사용)
+
+
+읽기 파티션 수 = 입력 파일·블록 수에 좌우 → small file이 많으면 태스크 폭발
+
+
+쓰기 파티션 수 = 출력 파일 수 (Iceberg 적재 시 파일 크기 결정 — 내 Mini-Batch 경험)
+
+
+■ 7. 진단 순서 (암기)
+Stage 소요시간 → Task duration 분포(median vs max) → Shuffle read/write 크기 → Spill → GC time → Input rows
+
+Spark 심화 — 2부: Structured Streaming
+■ 1. 핵심 추상화: “무한히 증가하는 테이블”
+스트림을 끝없이 행이 추가되는 테이블로 보고, 쿼리를 그 테이블에 반복 실행. 그래서 배치와 같은 DataFrame API를 씀 — 이게 Spark 스트리밍의 최대 강점(배치·스트리밍 로직 통합)
+■ 2. 실행 모델 — Micro-Batch
+Trigger 발동 → 소스에서 처리할 offset 범위 결정 → WAL에 기록
+→ 배치 실행 → 싱크에 쓰기 → 커밋 로그 기록 → 반복
+
+Trigger 종류 (실무 선택 지점):
+ProcessingTime("5 minutes") — 주기 실행
+
+
+Trigger.Once / Trigger.AvailableNow (권장) — 있는 데이터 다 처리하고 종료. 스트리밍 코드로 배치처럼 운영 — 내 Mini-Batch + CronJob 구조와 사실상 같은 목적
+
+
+Trigger.Continuous — 실험적, 밀리초 지연 (실무 거의 미사용)
+
+
+핵심: 트리거 간격 = 파일 생성 빈도 = 저장 레이아웃 (내 30배 개선의 본질)
+
+
+■ 3. 체크포인트 구조 (장애 복구의 실체)
+checkpointLocation/
+├── offsets/     ← 배치별 처리 예정 offset (WAL, 실행 전 기록)
+├── commits/     ← 완료된 배치 기록
+├── state/       ← 상태 저장소 스냅샷
+└── metadata/    ← 쿼리 ID
+
+복구 로직: offsets에는 있는데 commits에 없는 배치 = 미완료 → 재처리
+
+
+결과적 exactly-once 조건: 소스가 재생 가능(Kafka) + 싱크가 멱등. 둘 중 하나라도 없으면 안 됨
+
+
+주의: 체크포인트는 쿼리와 강결합 — 로직을 크게 바꾸면 호환 안 될 수 있음. 삭제하면 처음부터 재처리
+
+
+■ 4. State Store (상태 기반 연산)
+집계·조인·dedup·mapGroupsWithState는 상태를 유지 — 기본 HDFSBackedStateStore(메모리+체크포인트), RocksDB 백엔드 권장(대용량 상태 시 GC 압박 회피)
+
+
+상태 무한 증가가 최대 리스크 → Watermark로 정리
+
+
+■ 5. Watermark — 정확성과 지연의 trade-off
+.withWatermark("event_ts", "10 minutes")
+
+의미: “현재까지 본 최대 event_ts - 10분”보다 오래된 데이터는 늦은 것으로 간주하고 버림
+
+
+두 가지 역할: ① late data 처리 기준 ② 상태·윈도우 정리 기준(이게 없으면 상태 무한 증가)
+
+
+차량 도메인 핵심 판단: 단절 후 재연결로 late data가 상시 → watermark를 짧게 잡으면 데이터 손실, 길게 잡으면 상태 증가 + 결과 지연. “얼마나 늦은 데이터까지 정확성에 포함할 것인가”의 비즈니스 판단
+
+
+■ 6. Output Mode
+Append — 확정된 행만 추가 (watermark 필요한 집계에서). 파일 싱크는 이것만 지원
+
+
+Update — 변경된 행만 출력 (집계 중간 결과 갱신)
+
+
+Complete — 전체 결과 테이블 재출력 (상태 무한 증가, 소규모만)
+
+
+■ 7. Kafka 소스 실무 옵션
+startingOffsets: latest / earliest / 특정 offset JSON
+
+
+maxOffsetsPerTrigger — 배치당 최대 레코드 수. backpressure 제어 + 첫 실행 시 폭주 방지 (재시작 후 lag이 클 때 필수)
+
+
+failOnDataLoss — retention으로 offset 소실 시 실패 여부
+
+
+Kafka 파티션 = Spark 태스크 1:1 매핑 (기본)
+
+
+■ 8. foreachBatch — 실무의 만능 열쇠
+def upsert(batch_df, batch_id):
+    batch_df.createOrReplaceTempView("s")
+    spark.sql("MERGE INTO target t USING s ON ... ")
+
+query.writeStream.foreachBatch(upsert).start()
+
+각 마이크로배치를 일반 DataFrame처럼 다룸 → MERGE INTO, 멀티 싱크 쓰기, 배치 API 재사용이 가능해짐
+
+
+Iceberg/Delta upsert의 표준 경로 — 스트리밍 API가 직접 지원 안 하는 연산을 여기서 처리
+
+
+주의: batch_id로 멱등성 직접 보장해야 함 (재시도 시 같은 batch_id 재실행 가능)
+
+
+■ 9. 배치 vs 스트리밍 선택 논리 (내 서사)
+“실시간이 가능해서가 아니라 필요해서 선택한다. 목적이 분석·ML 기반 저장이면 분 단위 지연은 허용 가능하고, 그 대가로 파일 효율과 운영 단순성을 얻는다. 우리는 상시 구동 스트리밍 대신 CronJob 배치를 택했는데, 요구 지연이 분 단위였고 리소스·운영 면에서 단순했기 때문이다. 지금이라면 Trigger.AvailableNow로 스트리밍 코드를 배치처럼 운영하는 방식도 고려할 것 — offset 관리를 체크포인트에 맡기면서 주기 실행의 장점을 얻으니까.”
+
+Spark Connect — 현재 회사 이야기용
+■ 1. 문제: 기존 Spark의 강결합
+전통 구조에서 Driver가 곧 애플리케이션 — 사용자 코드와 Spark 실행 엔진이 같은 JVM에 존재
+
+
+그래서: 클라이언트가 무거움(전체 Spark 의존성 필요), 버전 강결합(클라이언트 Spark 버전 = 클러스터 버전), 멀티테넌시 어려움, 사용자 코드가 Driver를 죽이면 전체 실패, IDE/노트북에서 원격 개발 불편
+
+
+■ 2. Spark Connect의 구조 (3.4+)
+클라이언트 (경량 라이브러리)
+  ↓ 미해결 논리 플랜을 Protobuf로 직렬화
+  ↓ gRPC 전송
+Spark Connect Server (Driver 내)
+  ↓ 플랜 해석 → Catalyst 최적화 → 실행
+  ↓ 결과를 Arrow 포맷으로 스트리밍 반환
+클라이언트
+
+핵심: DataFrame API가 “실행”이 아니라 “플랜 생성”이 됨. 클라이언트는 플랜만 만들어 보내고, 실행은 서버가
+
+
+전송 포맷: Protobuf(플랜) + Arrow(결과) — 둘 다 언어 중립적이라 클라이언트를 여러 언어로 만들 수 있음
+
+
+■ 3. 얻는 것
+클라이언트 경량화 — JVM·Spark 전체 없이 얇은 라이브러리만. 노트북·IDE·앱에서 직접 연결
+
+
+버전 분리 — 클러스터를 업그레이드해도 클라이언트 코드 유지 (안정적 API 계약)
+
+
+멀티테넌시 — 하나의 서버가 여러 세션을 격리 처리. 사용자별로 Spark 클러스터를 띄우지 않아도 됨
+
+
+안정성 — 사용자 코드가 Driver JVM 밖에 있어 크래시 격리
+
+
+언어 확장 — Go, Rust 등 클라이언트 등장
+
+
+■ 4. 제약 (정직하게 말할 부분)
+RDD API 미지원 — DataFrame/SQL 중심 (대부분 문제 없음)
+
+
+SparkContext 직접 접근, 일부 내부 API 불가
+
+
+커스텀 UDF는 클라이언트↔서버 간 코드 배포 이슈가 있음
+
+
+성숙도가 계속 올라가는 중 — 버전별 지원 범위 확인 필요
+
+
+■ 5. “런타임 제공자” 서사로 착지 (면접 발화)
+“현재 회사에서는 사용자에게 Spark를 Spark Connect 방식으로 제공하고 있습니다. 기존 방식은 Driver가 곧 애플리케이션이라 사용자마다 클러스터를 띄우거나 무거운 클라이언트를 배포해야 하는데, Connect는 클라이언트가 논리 플랜만 gRPC로 보내고 실행은 서버가 담당하는 구조여서 — 클라이언트가 가벼워지고, 클러스터 버전과 분리되고, 하나의 서버가 여러 세션을 격리 처리할 수 있습니다. 플랫폼 관점에서 이게 중요한 이유는 런타임을 제품처럼 제공할 수 있다는 점이라고 봅니다. 사용자는 접속만 하면 되고, 버전 업그레이드나 리소스 배분 같은 복잡성은 플랫폼이 흡수하니까요. 제가 지금 다루는 문제가 정확히 그 지점 — Runtime 영역에서 사용자별 격리와 리소스 배분을 어떻게 설계할 것인가입니다. StarRocks에서 Resource Group으로 워크로드를 격리하는 것과 같은 고민이 Spark 쪽에도 있는 거고요.”
+앵커 3개:
+“DataFrame이 실행이 아니라 플랜 생성이 된다” (Connect의 본질)
+
+
+“클라이언트-클러스터 버전 분리 = 플랫폼이 업그레이드 자유를 얻는다”
+
+
+“런타임을 제품으로 제공한다” (제공자 정체성으로 착지)
+
+
+Kafka → Iceberg Spark 적재 — 실무 논점 정리
+
+■ 1. 읽기 단계 (Kafka)
+① Offset 관리 — 배치 방식의 핵심 결정
+스트리밍이면 체크포인트가 자동 관리하지만, 배치 CronJob은 offset을 스스로 관리해야 함
+
+
+선택지: 
+컨슈머 그룹 offset 활용
+외부 저장소에 기록
+startingOffsets~endingOffsets 범위 명시
+
+
+중요: 배치 시작 시점에 읽을 범위를 고정해야 함 — 안 그러면 실행 중 계속 유입되는 데이터로 배치 경계가 모호해짐
+
+
+② 배치 크기 제어
+Kafka 파티션 = Spark 태스크 1:1 → 파티션 수가 병렬성 상한
+
+
+5분치가 얼마나 되는지 예측하고, 급증 시(재시작 후 lag 큼) 한 배치가 감당 못 할 양이 들어오는 걸 방지 — maxOffsetsPerTrigger 또는 offset 범위 제한
+
+
+내 케이스: 평균 50만 건/5분, burst 시 그 이상 → 첫 실행이나 장애 복구 시 폭주 방지가 실무 포인트
+
+
+③ 역직렬화
+Avro + Schema Registry면 스키마 조회 후 디코딩. 스키마 캐싱으로 매 레코드 조회 방지
+
+
+실패 레코드 처리: 전체 실패 vs DLQ 격리 — 정상은 흘리고 불량만 분리
+
+
+
+■ 2. 변환 단계 (여기가 CDC 특유)
+① Dedup이 필수 (MERGE 전제 조건)
+ROW_NUMBER() OVER (PARTITION BY pk ORDER BY event_ts DESC, ord DESC) = 1
+
+MERGE INTO는 source 키당 1건을 전제 → 위반 시 런타임 에러
+
+
+정렬 기준의 함정: timestamp만으로는 같은 밀리초 내 순서 불명 → Debezium ord 값을 밀리초 뒤에 붙여 보강 (내 실사례)
+
+
+이 dedup 자체가 shuffle을 유발하는 무거운 연산 — 파티션 수 관리 필요
+
+
+② 타입·스키마 정합 (내 실제 트러블슈팅)
+epoch Long → Timestamp 명시 캐스팅 (밀리초 정밀도 유지)
+
+
+Nested StructType의 nullable 속성을 기존 스키마에 정렬
+
+
+“Schema Evolution은 메타데이터의 일, 이건 데이터의 일” — 쓰기 경로에서 해결
+
+
+③ op 타입별 분기
+c/u는 upsert, d는 delete 또는 tombstone → 삭제를 물리 삭제할지 soft delete할지가 다운스트림 계약
+
+
+
+■ 3. 쓰기 단계 (가장 중요)
+① MERGE INTO 최적화
+ON 조건에 파티션 컬럼 포함 → 프루닝 유도, 없으면 매 배치가 테이블 전체 스캔
+
+
+Late data 방어: WHEN MATCHED AND s.event_ts > t.event_ts THEN UPDATE — 늦게 온 오래된 이벤트가 최신을 덮지 않게
+
+
+CoW vs MoR 선택 → 변경 빈도 높으면 MoR + compaction
+
+
+② 파일 레이아웃 제어 (앞서 정리한 “충분조건”)
+쓰기 전 repartition으로 태스크 수 조정 → 파일 수 결정
+
+
+write.target-file-size-bytes 설정
+
+
+파티션 걸친 배치면 파일 수 = 파티션 수 × 태스크 수로 곱셈 → 파티션 컬럼 기준 repartition 고려
+
+
+③ 멱등성
+MERGE 기반이라 재실행해도 결과 동일 (자연키 upsert)
+
+
+배치 단위 재시도 시 같은 offset 범위를 다시 읽어도 안전
+
+
+
+■ 4. 운영 단계
+커밋 충돌: Compaction과 겹치면 OCC 재시도 → 실행 시각 오프셋 분리 (01~03분 / 31~33분)
+
+
+유지보수 3종: Compaction 30분, Rewrite Manifest 1시간, Expire Snapshots 2주
+
+
+모니터링: Consumer Lag 추세, 배치 소요시간, 커밋당 파일 수·크기, Compaction 성공률
+
+
+실패 처리: CronJob 실패 시 다음 주기가 밀린 offset부터 처리 — 자동 catch-up 구조
+
+
+
+■ 5. 왜 Structured Streaming이 아니라 CronJob 배치였나 (논리 정리)
+핵심 프레임: “요구가 정한 것이지 기술이 정한 게 아니다”
+① 요구 지연이 분 단위였다
+Lakehouse의 목적이 분석·ML 기반 저장이지 실시간 서빙이 아님
+
+
+실시간이 필요한 소비처는 Public Topic을 직접 구독하는 별도 경로가 이미 있었음
+
+
+→ 5분 지연이 허용되는데 상시 구동 스트리밍을 유지할 이유가 없음
+
+
+② 상시 구동의 운영 비용을 피할 수 있었다
+Structured Streaming은 드라이버가 계속 살아 있어야 함 → 리소스 상시 점유, 장애 시 재시작 관리, 체크포인트 상태 관리
+
+
+CronJob은 실행 시점에만 리소스 사용 → 배치가 순간 집중형이라 다른 워크로드와의 경합 창이 짧음
+
+
+실패 시 복구도 단순: 다음 주기가 자동으로 밀린 분량을 처리
+
+
+③ 실행 주기를 유지보수 주기와 함께 설계할 수 있었다
+Compaction 30분 주기와 충돌하지 않도록 실행 시각을 명시적으로 배치 — 상시 스트리밍이면 언제든 커밋이 발생해 OCC 충돌 제어가 어려움
+
+
+**“커밋 시점을 통제할 수 있다”**는 게 배치의 숨은 장점
+
+
+④ 파일 생성 빈도를 결정론적으로 제어할 수 있었다
+이게 애초의 문제(Small File)를 푸는 방법이었음 — 5분에 정확히 한 번 커밋
+
+
+스트리밍 트리거로도 가능하지만, “주기 실행”이라는 성격을 명시적으로 드러내는 구조가 팀 이해와 운영에 명확했음
+
+
+⑤ 팀 스택과의 정합
+이미 EKS CronJob으로 다른 배치들이 돌고 있었고, Kyuubi로 Spark 리소스를 관리하는 체계가 있었음 → 새로운 운영 패턴을 도입하지 않는 선택
+
+
+정직한 균형 (반드시 붙일 것):
+“다만 offset 관리를 직접 해야 한다는 게 배치의 대가입니다. 지금이라면 Trigger.AvailableNow를 검토할 것 같습니다 — 스트리밍 API로 offset 관리를 체크포인트에 맡기면서도, 있는 데이터를 처리하고 종료하는 배치처럼 운영할 수 있으니 두 방식의 장점을 합칠 수 있거든요.”
+
+■ 6. 발화 압축 (1분 30초)
+“Kafka에서 읽어 Iceberg에 적재하는 파이프라인인데, 단계별로 신경 쓴 지점이 다릅니다. 읽기에서는 배치 경계를 고정하는 게 중요했습니다. 배치 방식이라 offset을 직접 관리해야 하고, 재시작 후 lag이 클 때 한 배치가 감당 못 할 양이 들어오는 걸 막아야 하니까요. 변환에서는 dedup이 핵심이었습니다. MERGE INTO는 source 키당 1건을 전제하는데 CDC는 한 배치에 같은 PK가 여러 번 들어오는 게 정상이라, ROW_NUMBER로 최신 1건만 남깁니다. 이때 timestamp만으로는 같은 밀리초 내 순서가 안 잡혀서 Debezium의 ord 값을 밀리초 뒤에 붙여 정렬 기준을 보강했습니다. 그리고 Java 스트리밍에서 PySpark로 전환하면서 epoch Long과 Timestamp 표현 차이, nested nullable 불일치가 있었는데, Iceberg Schema Evolution으로는 풀 수 없는 문제라 — 값의 해석 규칙이 필요한 데이터 변환이니까요 — DataFrame 단계에서 명시적 캐스팅으로 해결했습니다. 쓰기가 가장 중요했습니다. MERGE의 ON 조건에 파티션 컬럼을 넣어 스캔 범위를 좁히고, late data가 최신을 덮지 않도록 event_ts 비교 조건을 걸고, 쓰기 전 repartition으로 파일 수를 제어했습니다. 트리거 간격이 필요조건이라면 쓰기 레이아웃 제어가 충분조건이라고 보는데, 5분으로 늘려도 태스크가 수백 개면 여전히 작은 파일이 수백 개 생기니까요. 운영에서는 Compaction과 커밋이 겹치면 Iceberg OCC 충돌로 재시도가 잦아져서, 실행 시각을 오프셋으로 분리했습니다. Structured Streaming 대신 CronJob 배치를 택한 건 요구 지연이 분 단위였기 때문입니다. Lakehouse는 분석·ML 목적이고, 실시간이 필요한 소비처는 Public Topic을 직접 구독하는 경로가 따로 있었거든요. 배치는 상시 드라이버를 유지할 필요가 없고, 실패해도 다음 주기가 밀린 분량을 자동으로 따라잡고, 무엇보다 커밋 시점을 통제할 수 있어 Compaction 주기와 함께 설계할 수 있었습니다. 다만 offset을 직접 관리해야 하는 대가가 있어서, 지금이라면 Trigger.AvailableNow로 스트리밍 API의 체크포인트 관리를 쓰면서 배치처럼 운영하는 방식도 검토할 것 같습니다.”
+앵커 4개:
+“트리거 간격이 필요조건, 쓰기 레이아웃이 충분조건”
+
+
+“MERGE는 키당 1건이 전제 — dedup과 정렬 기준 보강”
+
+
+“배치의 숨은 장점은 커밋 시점을 통제할 수 있다는 것”
+
+
+“실시간이 가능해서가 아니라 필요해서 — 실시간 소비처는 별도 경로가 있었다”
+
+
+Kafka → Iceberg Spark 배치 적재 — 최종 면접 스크립트
+
+■ 0. 배경 (30초 요약)
+CDC 이벤트를 Kafka에서 읽어 Iceberg에 적재하는 파이프라인
+
+
+문제: Kafka Connect 실시간 스트리밍 적재 → 분당 수십만 건을 10초 내외로 commit → 커밋마다 수십 MB 파일 양산 → 파일 생성 속도가 Compaction 병합 속도를 앞지름 → Compaction 실패
+
+
+진단: 근본 원인은 파일 크기가 아니라 커밋 빈도
+
+
+해결: PySpark 기반 5분 Mini-Batch 전환 → 커밋 빈도 약 30배 감소, EKS CronJob + Kyuubi 운영
+
+
+
+■ 1. 읽기 — Kafka
+① Offset 관리 (배치 방식의 대가)
+스트리밍은 체크포인트가 자동 관리하지만 배치는 직접 관리 → S3의 별도 경로에 offset 저장
+
+
+배치 시작 시 이전 offset을 읽고, 완료 후 갱신
+
+
+② 읽기 범위와 병렬성
+endingOffsets = latest — 5분치를 전부 읽는 방식
+
+
+Kafka 파티션 = Spark 태스크 (파티션 내에서만 순서가 보장되므로 자연스러운 병렬 단위)
+
+
+파티션 수가 병렬성 상한 → minPartitions로 offset 범위를 분할해 태스크 증설 (뒤에서 dedup하는 구조라 파티션 내 순서 의존 없음)
+
+
+③ latest 방식의 리스크 인식 (회고 — 물으면 꺼낼 것)
+당시엔 문제없었던 이유: 5분 주기라 배치당 부하가 예측 가능, CDC라 유입량 자체에 상한
+
+
+안전장치: MERGE 기반 멱등 적재 → 실패해도 다음 주기가 같은 구간 재처리 → 실패가 손실이 아니라 지연으로만 나타남
+
+
+지금이라면: offset 상한을 둘 것. 첫 적재나 장애로 밀린 상황에서 한 배치가 감당 못 할 양이 들어오면 배치 시간 > 주기 → lag 증가 → 배치 더 커짐의 악순환. Small File 문제와 같은 패턴 — 유입 속도가 처리 속도를 앞지르는 임계
+
+
+
+■ 2. 변환
+① Dedup — MERGE의 전제 조건
+MERGE INTO는 source 키당 1건을 전제 → CDC는 한 배치에 같은 PK 다건이 정상 → 위반 시 런타임 에러
+
+
+ROW_NUMBER() OVER (PARTITION BY pk ORDER BY ...) = 1
+
+
+정렬 기준 보강: timestamp만으로는 같은 밀리초 내 순서 불명 → Debezium의 ord 값을 밀리초 뒤에 추가
+
+
+② 스키마 정합 (Java Streaming → PySpark 전환 시)
+epoch(Long) → Timestamp 명시 캐스팅 (밀리초 정밀도 유지), Nested StructType nullable 정렬
+
+
+핵심 논리: Iceberg의 타입 승격은 재작성 없이 재해석 가능한 확장(int→long 등)만 허용. epoch→Timestamp는 값의 해석 규칙이 필요한 변환 → “Schema Evolution은 메타데이터의 일, 이건 데이터의 일” → 쓰기 경로에서 해결
+
+
+결과: 기존 데이터 재적재 없이 신규 파이프라인이 기존 적재분과 정합
+
+
+
+■ 3. 쓰기 — MERGE INTO + 파일 레이아웃
+① MERGE 최적화
+ON 조건에 파티션 컬럼 포함 → 프루닝 유도 (없으면 매 배치가 테이블 전체 스캔)
+
+
+Late data 방어: WHEN MATCHED AND s.event_ts > t.event_ts THEN UPDATE
+
+
+MERGE는 read-modify-write → 호출 빈도를 줄이는 것 자체가 최적화 (Mini-Batch의 본질)
+
+
+② 파일 수 제어 — 3단계 서사 (핵심)
+1단계: repartition으로 태스크 수를 줄여 파일 수 감소
+Compaction 실패라는 급한 상황 → 즉시 검증 가능, 커밋당 결과가 결정론적
+
+
+2단계: 두 제약이 동시에 작동하고 있었음
+Iceberg write.target-file-size-bytes는 기본값 512MB로 이미 작동 중
+
+
+실제 파일 수 = max(repartition N, 데이터양 ÷ target 크기)
+
+
+평상시엔 repartition이, burst 땐 target이 롤링해 거대 파일 방지
+
+
+3단계: 운영 중 인식한 비대칭
+target은 큰 파일을 쪼갤 뿐, 작은 파일을 합치지는 못함
+
+
+유입이 적은 시간대엔 태스크당 데이터가 적어 작은 파일 재발 → 원인은 repartition으로 태스크 수를 고정한 것 자체
+
+
+개선 방향: 파일 수를 직접 정하지 말고, distribution-mode = hash로 같은 파티션 데이터를 한 태스크에 모으고 크기 기준은 target에 위임
+
+
+앵커: “개수를 고정하면 크기가 흔들리고, 크기를 고정하면 개수가 조절된다”
+
+
+③ 결과 수치
+전: 10초 커밋 / 커밋당 수십 MB
+
+
+후: 5분 배치 / 커밋당 수백 MB / 커밋 빈도 30배 감소
+
+
+보너스: 대형 파일일수록 압축 효율↑ → “Small File은 파일 수도 많고 압축도 나쁜 이중 낭비”
+
+
+
+■ 4. 운영
+OCC 충돌 회피: Compaction(30분)과 배치(5분)가 겹치면 재시도 빈발 → 실행 시각 오프셋 분리(01~03분 / 31~33분) + 겹쳐도 OCC 재시도가 안전망
+
+
+유지보수 3종: Compaction 30분 / Rewrite Manifest 1시간 / Expire Snapshots 2주 — 데이터 파일뿐 아니라 메타데이터·매니페스트까지 관리 대상
+
+
+모니터링: Consumer Lag 추세(값 아님), 배치 소요시간(주기 대비 비율), 커밋당 파일 수·크기, Compaction 성공률, lag/retention 비율(복구 데드라인)
+
+
+
+■ 5. 왜 Structured Streaming이 아니라 CronJob 배치였나
+요구 지연이 분 단위 — Lakehouse는 분석·ML 목적. 실시간 소비처는 Public Topic 직접 구독 경로가 별도 존재
+
+
+상시 드라이버 불필요 — 실행 시점만 리소스 점유, 실패 시 다음 주기가 자동 catch-up
+
+
+커밋 시점 통제 가능 — Compaction 주기와 함께 설계 (배치의 숨은 장점)
+
+
+팀 스택 정합 — 이미 EKS CronJob + Kyuubi 체계 존재
+
+
+균형: “대가는 offset 직접 관리. 지금이라면 Trigger.AvailableNow를 검토 — 체크포인트에 offset을 맡기면서 배치처럼 주기 실행”
+
+
+
+■ 압축 발화 (1분 30초 버전)
+“실시간 스트리밍 적재에서 Compaction이 실패하고 있었는데, 원인을 파일 크기가 아니라 커밋 빈도로 진단하고 PySpark 5분 Mini-Batch로 전환한 작업입니다. 읽기는 배치 방식이라 offset을 직접 관리해야 해서 S3에 저장했고, Kafka 파티션이 곧 Spark 태스크라 병렬성이 파티션 수에 묶이는 걸 minPartitions로 보완했습니다. 다만 endingOffsets를 latest로 뒀는데, 지금 돌아보면 상한을 두는 게 맞았다고 봅니다 — 장애로 밀리면 배치가 커지고 주기를 넘겨 lag이 더 쌓이는 악순환이 가능하니까요. 당시엔 MERGE 기반 멱등 적재라 실패가 손실이 아니라 지연으로만 나타나는 게 안전장치였습니다. 변환에서는 dedup이 핵심이었습니다. MERGE는 source 키당 1건을 전제하는데 CDC는 같은 PK가 여러 번 들어오는 게 정상이라, ROW_NUMBER로 최신 1건만 남기되 timestamp만으로는 같은 밀리초 내 순서가 안 잡혀 Debezium의 ord 값을 정렬 기준에 추가했습니다. 그리고 Java에서 PySpark로 전환하며 epoch Long과 Timestamp 표현 차이가 있었는데, Schema Evolution으로는 풀 수 없는 문제 — 값의 해석 규칙이 필요한 데이터 변환이라 — DataFrame 단계 명시적 캐스팅으로 해결해 기존 데이터 재적재 없이 전환했습니다. 쓰기가 가장 배운 게 많았습니다. 처음엔 repartition으로 태스크 수를 줄여 파일 수를 감소시켰고 급한 문제는 해결됐습니다. Iceberg의 target-file-size는 기본값 512MB로 이미 작동 중이어서, 실제로는 파일 수가 repartition과 target 중 더 강한 제약으로 결정되는 구조였습니다 — 평상시엔 repartition이, 유입이 튀면 target이 롤링해 거대 파일을 막는 식으로요. 그런데 반대 방향엔 비대칭이 있어서, target은 큰 파일을 쪼갤 뿐 작은 파일을 합치지는 못합니다. 유입이 적은 시간대엔 여전히 작은 파일이 생겼고, 원인은 repartition으로 태스크 수를 고정한 것 자체였습니다. 그래서 파일 수를 직접 정하는 대신 distribution-mode를 hash로 두고 크기 기준은 target에 맡기는 방향이 맞다고 정리했습니다. 운영에서는 Compaction과 커밋이 겹치면 OCC 충돌로 재시도가 잦아져 실행 시각을 오프셋으로 분리했고, 데이터 파일뿐 아니라 매니페스트와 스냅샷까지 각자 주기로 관리했습니다.”
+
+■ 앵커 6개 (암기)
+“원인은 파일 크기가 아니라 커밋 빈도”
+
+
+“MERGE는 키당 1건이 전제 — dedup + ord로 정렬 보강”
+
+
+“Schema Evolution은 메타데이터의 일, 이건 데이터의 일”
+
+
+“파일 수 = max(repartition, 데이터양 ÷ target)”
+
+
+“target은 큰 파일을 쪼갤 뿐 작은 파일을 합치지 못한다”
+
+
+“실패가 손실이 아니라 지연으로만 나타나는 구조” (멱등성)
+
+
+ClickHouse 기반 대량 로그 배치 시스템
+■ 차량 이벤트 로그로 보면 달라지는 것들
+① 규모의 차원이 다름
+시스템 로그: 서비스 수 × 요청량
+차량 이벤트: 차량 대수 × 신호 종류 × 발생 빈도 — 양산 확대되면 기하급수적. "고volume 시계열"이라는 ClickHouse의 전제 조건에 정면으로 부합
+② 데이터의 성격이 '자산'
+시스템 로그는 며칠 뒤 버려도 되지만, 차량 이벤트는 ML 학습 데이터·품질 이슈 추적·규제 대응에 쓰이는 원본 자산
+그래서 Lakehouse(장기 원본) + ClickHouse(최근 구간 서빙)의 이중 구조가 필요한 거고 — 앞서 정리한 "왜 둘 다 필요한가"가 여기서 실질적 근거를 얻어
+③ 스키마 설계가 훨씬 어려워짐
+ 시스템 로그는 (service, level, message)로 대충 수렴하는데, 차량 이벤트는:
+이벤트 타입이 수백~수천 종 (센서 신호, 에러코드, 트립 이벤트, 사용자 조작)
+차종·SW 버전마다 정의가 다름 (OTA)
+→ 정렬 키 설계: (vehicle_id, ts) vs (event_type, ts) vs (vehicle_model, vehicle_id, ts) — 지배적 쿼리가 뭐냐에 따라 갈리고, 하나로 안 되면 Projection이나 별도 테이블로 이중화
+→ 필드 저장: 공통 필드(vehicle_id, ts, event_type, sw_version)는 컬럼, 이벤트별 payload는 Map/JSON — "raw는 유연하게, 자주 쓰는 건 구조화"의 실전 적용
+④ 품질 검증이 진짜 문제가 됨 (JD 항목의 실체)
+ 시스템 로그엔 없는 요구들:
+물리적 타당성 — 속도 300km/h, 좌표가 바다 한가운데, 배터리 음수값
+디바이스 커버리지 — 평소 보고하던 차량이 사라짐 (전체 볼륨은 정상인데 특정 그룹만 누락)
+시간 정합성 — 단말 시계 오차, 미래 타임스탬프, late data
+중복 — 네트워크 단절 후 재전송
+⑤ 이상 탐지의 대상이 인프라가 아니라 도메인
+시스템 로그: "에러율이 올랐다"
+차량 이벤트: "특정 차종의 특정 SW 버전에서 이 에러코드가 급증" → 품질 이슈의 조기 발견. 이게 JD의 "인사이트 도출 → 서비스 반영" 루프의 실체일 가능성이 높아
+■ 그러면 ClickHouse의 역할이 이렇게 정리돼
+계층
+역할
+Kafka
+수집 버퍼 (재전송·스파이크 흡수)
+ClickHouse
+최근 구간 이벤트의 탐색·집계 엔진 — 대시보드, 이상 탐지 쿼리, 품질 모니터링, 엔지니어의 ad-hoc 조사
+Lakehouse
+전체 이력 원본, ML 학습 데이터 생성, 대규모 배치 가공
+Spark
+그 가공의 실행 엔진
+
+■ 면접 발화 (이 관점으로 말하면)
+"말씀하신 로그가 시스템 로그만이 아니라 차량에서 발생하는 이벤트 로그까지 포함하는 거라면, JD 항목들이 한 줄기로 이해됩니다. 품질 검증이나 카탈로그 운영은 단순 시스템 로그에는 과한 요구인데, 차량 이벤트는 ML 학습과 품질 추적에 쓰이는 자산이니까요.
+ 그러면 ClickHouse의 역할이 대시보드 서빙을 넘어 최근 구간 이벤트의 탐색·집계 엔진이 됩니다. 특정 차종의 특정 SW 버전에서 어떤 이벤트가 급증했는지를 초 단위로 파고들 수 있어야 품질 이슈를 조기에 발견할 수 있으니까요. 그리고 전체 이력 원본과 ML 학습 데이터 생성은 Lakehouse와 Spark가 담당하는 이중 구조가 자연스럽고요.
+ 설계에서 어려운 지점은 스키마일 것 같습니다. 이벤트 타입이 수백 종이고 차종·SW 버전마다 정의가 다를 텐데, 공통 필드는 정규 컬럼으로 두고 이벤트별 payload는 Map이나 JSON으로 받아 스키마 진화 부담을 줄이는 방향, 그리고 정렬 키를 지배적 쿼리 패턴 — 차량 단위 조회냐 이벤트 타입 단위 조회냐 — 에 맞추는 판단이 핵심일 것 같습니다."
+앵커: "시스템 로그는 버려도 되는 흔적, 차량 이벤트는 보존해야 할 자산 — 그래서 품질·카탈로그·이중 저장이 필요해진다."
+
+ClickHouse의 Index
+■ 1. Secondary Index — 정확히는 "Data Skipping Index"
+용어부터 정확히 하면, ClickHouse의 보조 인덱스는 RDBMS의 인덱스와 성격이 달라. 행을 직접 가리키지 않고, "이 granule 블록은 읽을 필요 없다"를 판정하는 용도야. 그래서 이름도 data skipping index.
+종류와 용도:
+타입
+원리
+적합한 컬럼
+minmax
+블록별 최소·최대값 저장
+값이 정렬 키와 상관관계 있는 것 (예: 수집 시각)
+set(N)
+블록별 고유값 집합(최대 N개)
+저카디널리티 — event_type, sw_version, vehicle_model
+bloom_filter
+확률적 존재 여부
+고카디널리티 동등 검색 — trace_id, session_id
+ngrambf / tokenbf
+문자열 n-gram/토큰 블룸필터
+로그 메시지 부분 문자열 검색
+
+차량 이벤트 케이스에 적용하면:
+sql
+ORDER BY (vehicle_id, timestamp)              -- 1차 프루닝: 차량 + 시간
+
+INDEX idx_event event_type TYPE set(100) GRANULARITY 4      -- 이벤트 타입 필터
+INDEX idx_sw sw_version TYPE set(50) GRANULARITY 4          -- SW 버전 필터  
+INDEX idx_trace trace_id TYPE bloom_filter GRANULARITY 1    -- 특정 건 추적
+→ "차량 없이 event_type만으로 조회" 같은 정렬 키가 못 커버하는 축을 보조
+중요한 한계 (이걸 말해야 깊이가 나와):
+정렬 키만큼 효율적이지 않아. 데이터가 그 값 기준으로 정렬돼 있지 않으면 대상 값이 여러 블록에 흩어져 있어서 스킵 효과가 제한적 — "정렬 키는 데이터를 모으고, skipping index는 흩어진 걸 걸러낼 뿐"
+쓰기·저장 비용이 붙음 — 인덱스도 유지 대상
+선택도가 낮으면 무용지물 — 어차피 대부분 블록을 읽어야 하면 인덱스 판정 비용만 추가
+그래서 검증이 필수: EXPLAIN indexes = 1로 실제 스킵되는 granule 수를 확인하고, system.query_log로 읽은 행 수를 비교해야 해. "인덱스를 걸었으니 빨라졌겠지"가 아니라 측정으로 검증하는 게 실무 감각이야.
+대안도 함께 알아두면 좋아 — Projection: 같은 데이터를 다른 정렬 순서로 한 벌 더 저장하는 기능. "차량 기준"과 "이벤트 타입 기준" 두 축이 모두 지배적이면, skipping index보다 projection이 근본적 해결이야 (저장 비용 2배가 대가).
+■ 2. "이벤트 로그를 하나로 모으는 공간" — 이 해석이 맞아 보여
+근거가 몇 겹으로 쌓여:
+JD 조직 설명: "자율주행·차량·서비스 데이터를 통합" — 서로 다른 계통의 이벤트를 한 곳에 모으는 게 명시적 미션
+데이터 루프의 전제: 차량 신호 + 사용자 행동 + 서비스 이벤트를 함께 봐야 인사이트가 나옴. 따로 저장돼 있으면 조인 자체가 어려움
+ClickHouse의 특성이 정확히 이 용도에 맞음: 이질적 이벤트를 넓은 테이블 하나 또는 공통 스키마로 수용(Map/JSON), 고volume 시계열, 임의 탐색 쿼리
+설계 관점에서 이어지는 질문 (면접에서 던지면 좋을 것): 이걸 단일 통합 테이블로 갈지, 이벤트 계통별 테이블 + 공통 스키마 규약으로 갈지가 핵심 판단이야.
+단일 테이블: 조인 없이 크로스 분석 가능, 대신 스키마가 최소공배수가 되고 프루닝 효율 저하
+분리 + 규약: 각 테이블이 자기 축으로 최적화되지만 크로스 분석 시 조인 필요 (ClickHouse의 약점)
+현실적 절충: 핵심 공통 필드로 구조화된 통합 이벤트 테이블 + 고volume 계통은 별도 테이블
+■ 발화 (두 내용을 합쳐서)
+"ClickHouse는 정렬 키 기반 프루닝이 1차이고, 그것만으로 안 되는 축은 data skipping index로 보조할 수 있습니다. 저카디널리티인 event_type이나 sw_version은 set 인덱스, trace_id처럼 고카디널리티 동등 검색은 bloom filter가 맞고요. 다만 정렬 키만큼 효율적이진 않습니다 — 데이터가 그 값으로 모여 있지 않으면 대상이 여러 블록에 흩어져 있어서 스킵 효과가 제한적이거든요. 그래서 EXPLAIN으로 실제 스킵되는 granule 수를 확인하고 검증해야 하고, 두 축이 모두 지배적이라면 skipping index보다 projection으로 다른 정렬본을 하나 더 두는 게 근본적일 수 있습니다.
+ 그리고 말씀하신 것처럼 데이터 플랫폼 관점에서는 ClickHouse가 차량과 소프트웨어에서 발생하는 이벤트를 한곳에 모으는 공간으로 쓰이는 게 자연스러워 보입니다. 조직 설명에도 자율주행·차량·서비스 데이터를 통합한다고 되어 있는데, 차량 신호와 사용자 행동을 함께 봐야 인사이트가 나오니까요. 그러면 설계에서 갈리는 지점은 이걸 통합 테이블 하나로 갈지, 계통별 테이블에 공통 스키마 규약을 둘지일 것 같습니다 — 통합하면 조인 없이 크로스 분석이 되지만 스키마가 최소공배수가 되고, 분리하면 각자 최적화되지만 ClickHouse가 약한 조인이 필요해지니까요."
+앵커: "정렬 키는 데이터를 모으고, skipping index는 흩어진 걸 걸러낼 뿐 — 두 축이 다 중요하면 projection."
+
